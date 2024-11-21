@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::{
         hash_map::Entry::{Occupied, Vacant},
         HashMap,
@@ -8,6 +7,9 @@ use std::{
     io::{BufWriter, Write},
     path::PathBuf,
 };
+
+use serde::Serialize;
+use serde_json;
 
 use crate::{
     app::{
@@ -43,6 +45,20 @@ use imessage_database::{
         plist::parse_plist,
     },
 };
+
+#[derive(Serialize)]
+struct MessageJson {
+    timestamp: String,
+    sender: String,
+    content: String,
+    read_status: Option<String>,
+    tapbacks: Vec<String>,
+    attachments: Vec<String>,
+    is_from_me: bool,
+    service: Option<String>,
+    edited_content: Option<Vec<String>>,
+    replies_to: Option<String>,
+}
 
 pub struct TXT<'a> {
     /// Data that is setup from the application's runtime
@@ -1869,16 +1885,16 @@ mod balloon_format_tests {
             url: Some("?messageType=1&interfaceVersion=1&sendDate=1697316869.688709"),
             title: None,
             subtitle: None,
-            caption: Some("Check In: Timer Started"),
+            caption: Some("Check In: Timer Started"),
             subcaption: None,
             trailing_caption: None,
             trailing_subcaption: None,
-            app_name: Some("Check In"),
-            ldtext: Some("Check In: Timer Started"),
+            app_name: Some("Check In"),
+            ldtext: Some("Check In: Timer Started"),
         };
 
         let expected = exporter.format_check_in(&balloon, "");
-        let actual = "Check\u{a0}In: Timer Started\nChecked in at Oct 14, 2023  1:54:29 PM";
+        let actual = "Check In: Timer Started\nChecked in at Oct 14, 2023  1:54:29 PM";
 
         assert_eq!(expected, actual);
     }
@@ -1898,16 +1914,16 @@ mod balloon_format_tests {
             url: Some("?messageType=1&interfaceVersion=1&sendDate=1697316869.688709"),
             title: None,
             subtitle: None,
-            caption: Some("Check In: Has not checked in when expected, location shared"),
+            caption: Some("Check In: Has not checked in when expected, location shared"),
             subcaption: None,
             trailing_caption: None,
             trailing_subcaption: None,
-            app_name: Some("Check In"),
-            ldtext: Some("Check In: Has not checked in when expected, location shared"),
+            app_name: Some("Check In"),
+            ldtext: Some("Check In: Has not checked in when expected, location shared"),
         };
 
         let expected = exporter.format_check_in(&balloon, "");
-        let actual = "Check\u{a0}In: Has not checked in when expected, location shared\nChecked in at Oct 14, 2023  1:54:29 PM";
+        let actual = "Check In: Has not checked in when expected, location shared\nChecked in at Oct 14, 2023  1:54:29 PM";
 
         assert_eq!(expected, actual);
     }
@@ -1927,16 +1943,16 @@ mod balloon_format_tests {
             url: Some("?messageType=1&interfaceVersion=1&sendDate=1697316869.688709"),
             title: None,
             subtitle: None,
-            caption: Some("Check In: Fake Location"),
+            caption: Some("Check In: Fake Location"),
             subcaption: None,
             trailing_caption: None,
             trailing_subcaption: None,
-            app_name: Some("Check In"),
-            ldtext: Some("Check In: Fake Location"),
+            app_name: Some("Check In"),
+            ldtext: Some("Check In: Fake Location"),
         };
 
         let expected = exporter.format_check_in(&balloon, "");
-        let actual = "Check\u{a0}In: Fake Location\nChecked in at Oct 14, 2023  1:54:29 PM";
+        let actual = "Check In: Fake Location\nChecked in at Oct 14, 2023  1:54:29 PM";
 
         assert_eq!(expected, actual);
     }
