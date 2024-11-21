@@ -38,13 +38,15 @@ use imessage_database::{
     tables::{
         attachment::Attachment,
         messages::{models::BubbleComponent, Message},
-        table::{Table, FITNESS_RECEIVER, ME, ORPHANED, YOU},
+        table::{Table, ME, ORPHANED, YOU},
     },
     util::{
         dates::{format, get_local_time, readable_diff, TIMESTAMP_FACTOR},
         plist::parse_plist,
     },
 };
+
+use std::borrow::Cow;
 
 #[derive(Serialize)]
 struct MessageJson {
@@ -146,6 +148,15 @@ impl<'a> Exporter<'a> for TXT<'a> {
             }
         }
         pb.finish();
+
+        // Close JSON arrays at the end
+        for file in self.files.values_mut() {
+            file.write_all(b"\n]}\n")
+                .map_err(RuntimeError::DiskError)?;
+        }
+        self.orphaned.write_all(b"\n]}\n")
+            .map_err(RuntimeError::DiskError)?;
+
         Ok(())
     }
 
@@ -181,212 +192,25 @@ impl<'a> Exporter<'a> for TXT<'a> {
 
 impl<'a> Writer<'a> for TXT<'a> {
     fn format_message(&self, message: &Message, indent_size: usize) -> Result<String, TableError> {
-        let indent = String::from_iter((0..indent_size).map(|_| " "));
-        // Data we want to write to a file
-        let mut formatted_message = String::new();
+        let json_message = MessageJson {
+            timestamp: format(&message.date(&self.config.offset)),
+            sender: self.config.who(message.handle_id, message.is_from_me(), &message.destination_caller_id).to_string(),
+            content: message.text.clone().unwrap_or_default(),
+            read_status: if message.date_read > 0 {
+                Some(format!("Read after {} seconds", message.date_read - message.date))
+            } else {
+                None
+            },
+            tapbacks: Vec::new(), // Will be populated in iter_messages
+            attachments: Vec::new(), // Will be populated in iter_messages
+            is_from_me: message.is_from_me(),
+            service: message.service.clone(),
+            edited_content: None, // Will be populated if message was edited
+            replies_to: None, // Will be populated if message is a reply
+        };
 
-        // Add message date
-        self.add_line(&mut formatted_message, &self.get_time(message), &indent);
-
-        // Add message sender
-        self.add_line(
-            &mut formatted_message,
-            self.config.who(
-                message.handle_id,
-                message.is_from_me(),
-                &message.destination_caller_id,
-            ),
-            &indent,
-        );
-
-        // If message was deleted, annotate it
-        if message.is_deleted() {
-            self.add_line(
-                &mut formatted_message,
-                "This message was deleted from the conversation!",
-                &indent,
-            );
-        }
-
-        // Useful message metadata
-        let message_parts = message.body();
-        let mut attachments = Attachment::from_message(&self.config.db, message)?;
-        let mut replies = message.get_replies(&self.config.db)?;
-
-        // Index of where we are in the attachment Vector
-        let mut attachment_index: usize = 0;
-
-        // Render subject
-        if let Some(subject) = &message.subject {
-            self.add_line(&mut formatted_message, subject, &indent);
-        }
-
-        // Handle SharePlay
-        if message.is_shareplay() {
-            self.add_line(&mut formatted_message, self.format_shareplay(), &indent);
-        }
-
-        // Handle Shared Location
-        if message.started_sharing_location() || message.stopped_sharing_location() {
-            self.add_line(
-                &mut formatted_message,
-                self.format_shared_location(message),
-                &indent,
-            );
-        }
-
-        // Generate the message body from it's components
-        for (idx, message_part) in message_parts.iter().enumerate() {
-            match message_part {
-                // Fitness messages have a prefix that we need to replace with the opposite if who sent the message
-                BubbleComponent::Text(text_attrs) => {
-                    if let Some(text) = &message.text {
-                        // Render edited message content, if applicable
-                        if message.is_part_edited(idx) {
-                            if let Some(edited_parts) = &message.edited_parts {
-                                if let Some(edited) =
-                                    self.format_edited(message, edited_parts, idx, &indent)
-                                {
-                                    self.add_line(&mut formatted_message, &edited, &indent);
-                                };
-                            }
-                        } else {
-                            let mut formatted_text = String::with_capacity(text.len());
-
-                            for text_attr in text_attrs {
-                                if let Some(message_content) =
-                                    text.get(text_attr.start..text_attr.end)
-                                {
-                                    formatted_text.push_str(
-                                        &self.format_attributed(message_content, &text_attr.effect),
-                                    )
-                                }
-                            }
-
-                            // If we failed to parse any text above, use the original text
-                            if formatted_text.is_empty() {
-                                formatted_text.push_str(text);
-                            }
-
-                            if formatted_text.starts_with(FITNESS_RECEIVER) {
-                                self.add_line(
-                                    &mut formatted_message,
-                                    &formatted_text.replace(FITNESS_RECEIVER, YOU),
-                                    &indent,
-                                );
-                            } else {
-                                self.add_line(&mut formatted_message, &formatted_text, &indent);
-                            }
-                        }
-                    }
-                }
-                BubbleComponent::Attachment(_) => match attachments.get_mut(attachment_index) {
-                    Some(attachment) => {
-                        if attachment.is_sticker {
-                            let result = self.format_sticker(attachment, message);
-                            self.add_line(&mut formatted_message, &result, &indent);
-                        } else {
-                            match self.format_attachment(attachment, message) {
-                                Ok(result) => {
-                                    attachment_index += 1;
-                                    self.add_line(&mut formatted_message, &result, &indent);
-                                }
-                                Err(result) => {
-                                    self.add_line(&mut formatted_message, result, &indent);
-                                }
-                            }
-                        }
-                    }
-                    // Attachment does not exist in attachments table
-                    None => self.add_line(&mut formatted_message, "Attachment missing!", &indent),
-                },
-                BubbleComponent::App => match self.format_app(message, &mut attachments, &indent) {
-                    // We use an empty indent here because `format_app` handles building the entire message
-                    Ok(ok_bubble) => self.add_line(&mut formatted_message, &ok_bubble, &indent),
-                    Err(why) => self.add_line(
-                        &mut formatted_message,
-                        &format!("Unable to format app message: {why}"),
-                        &indent,
-                    ),
-                },
-                BubbleComponent::Retracted => {
-                    if let Some(edited_parts) = &message.edited_parts {
-                        if let Some(edited) =
-                            self.format_edited(message, edited_parts, idx, &indent)
-                        {
-                            self.add_line(&mut formatted_message, &edited, &indent);
-                        };
-                    }
-                }
-            };
-
-            // Handle expressives
-            if message.expressive_send_style_id.is_some() {
-                self.add_line(
-                    &mut formatted_message,
-                    self.format_expressive(message),
-                    &indent,
-                );
-            }
-
-            // Handle Tapbacks
-            if let Some(tapbacks_map) = self.config.tapbacks.get(&message.guid) {
-                if let Some(tapbacks) = tapbacks_map.get(&idx) {
-                    let mut formatted_tapbacks = String::new();
-                    tapbacks
-                        .iter()
-                        .try_for_each(|tapbacks| -> Result<(), TableError> {
-                            let formatted = self.format_tapback(tapbacks)?;
-                            if !formatted.is_empty() {
-                                self.add_line(
-                                    &mut formatted_tapbacks,
-                                    &self.format_tapback(tapbacks)?,
-                                    &indent,
-                                );
-                            }
-                            Ok(())
-                        })?;
-
-                    if !formatted_tapbacks.is_empty() {
-                        self.add_line(&mut formatted_message, "Tapbacks:", &indent);
-                        self.add_line(&mut formatted_message, &formatted_tapbacks, &indent);
-                    }
-                }
-            }
-
-            // Handle Replies
-            if let Some(replies) = replies.get_mut(&idx) {
-                replies
-                    .iter_mut()
-                    .try_for_each(|reply| -> Result<(), TableError> {
-                        let _ = reply.generate_text(&self.config.db);
-                        if !reply.is_tapback() {
-                            self.add_line(
-                                &mut formatted_message,
-                                &self.format_message(reply, 4)?,
-                                &indent,
-                            );
-                        }
-                        Ok(())
-                    })?;
-            }
-        }
-
-        // Add a note if the message is a reply
-        if message.is_reply() && indent.is_empty() {
-            self.add_line(
-                &mut formatted_message,
-                "This message responded to an earlier message.",
-                &indent,
-            );
-        }
-
-        if indent.is_empty() {
-            // Add a newline for top-level messages
-            formatted_message.push('\n');
-        }
-
-        Ok(formatted_message)
+        serde_json::to_string_pretty(&json_message)
+            .map_err(|e| TableError::Messages(rusqlite::Error::InvalidColumnName(e.to_string())))
     }
 
     fn format_attachment(
@@ -1058,7 +882,7 @@ mod tests {
     use crate::{
         app::export_type::ExportType, exporters::exporter::Writer, Config, Exporter, Options, TXT,
     };
-    use imessage_database::{tables::table::ME, util::platform::Platform};
+    use imessage_database::tables::table::ME;
 
     #[test]
     fn can_create() {
@@ -1609,6 +1433,7 @@ mod tests {
         // Create exporter
         let options = Options::fake_options(ExportType::Txt);
         let mut config = Config::fake_app(options);
+        // Modify this
         config.options.platform = Platform::iOS;
         let exporter = TXT::new(&config).unwrap();
 
